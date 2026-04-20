@@ -1,0 +1,11 @@
+# DynaNFE Requirements
+# Install openpi first: cd openpi && pip install -e .
+
+# Core dependencies (installed via openpi)
+torch>=2.0.0
+numpy>=1.24.0
+safetensors>=0.4.0
+
+# Optional: for development
+# pytest>=7.0.0
+# black>=23.0.0
