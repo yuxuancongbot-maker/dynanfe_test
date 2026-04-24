@@ -42,7 +42,7 @@ class Pi0Config(_model.BaseModelConfig):
 
     # NFE Router: discrete NFE classification
     use_nfe_router: bool = False
-    nfe_options: Tuple[int, ...] = (1, 2, 4)  # Available NFE step options
+    nfe_options: Tuple[int, ...] = (1, 2)  # Available NFE step options
     router_hidden_dim: int = 256  # Hidden dim for NFE router MLP
 
     def __post_init__(self):
@@ -57,6 +57,9 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune",
                 "max-autotune-no-cudagraphs",
             ]
+
+        if self.use_nfe_router:
+            assert tuple(self.nfe_options) == (1, 2), "nfe_options must be exactly (1, 2) when use_nfe_router=True"
 
     @property
     @override

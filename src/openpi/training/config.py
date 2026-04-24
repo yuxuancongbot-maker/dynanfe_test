@@ -828,7 +828,7 @@ _CONFIGS = [
             discrete_state_input=False,
             pytorch_compile_mode="max-autotune",
             use_nfe_router=True,
-            nfe_options=(1, 2, 4),
+            nfe_options=(1, 2),
             router_hidden_dim=256,
         ),
         data=LeRobotLiberoDataConfig(

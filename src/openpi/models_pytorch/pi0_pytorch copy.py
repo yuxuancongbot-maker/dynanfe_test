@@ -49,38 +49,6 @@ def sample_beta(alpha, beta, bsize, device):
     return dist.sample((bsize,))
 
 
-class MixedTimestepSampler:
-    """
-    Mixed LogisticNormal + Uniform distribution for L1 Flow training.
-    Emphasizes intermediate timesteps while ensuring non-zero probability at boundaries.
-    """
-
-    def __init__(self, alpha=0.99, device="cuda"):
-        self.alpha = alpha
-        self.device = device
-        self.logistic_normal = torch.distributions.LogisticNormal(
-            torch.tensor([0.0], device=device),
-            torch.tensor([1.0], device=device),
-        )
-
-    def sample(self, bsize):
-        t = torch.zeros(bsize, device=self.device)
-        use_logistic = torch.rand(bsize, device=self.device) < self.alpha
-
-        # LogisticNormal part: ~sigmoid(N(0,1)) → concentrated in [0.3, 0.7]
-        n_logistic = use_logistic.sum().item()
-        if n_logistic > 0:
-            x = torch.randn(n_logistic, device=self.device)
-            t[use_logistic] = torch.sigmoid(x)
-
-        # Uniform part
-        n_uniform = (~use_logistic).sum().item()
-        if n_uniform > 0:
-            t[~use_logistic] = torch.rand(n_uniform, device=self.device)
-
-        return t
-
-
 def make_att_2d_masks(pad_masks, att_masks):
     """Copied from big_vision.
 
@@ -120,10 +88,6 @@ class PI0Pytorch(nn.Module):
         self.pi05 = config.pi05
         self.l1_flow = getattr(config, "l1_flow", False)
 
-        # L1 Flow: use mixed timestep sampler
-        if self.l1_flow:
-            self.timestep_sampler = MixedTimestepSampler(alpha=0.99, device="cuda")
-
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
@@ -133,6 +97,10 @@ class PI0Pytorch(nn.Module):
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
         )
+
+        # Keep attention backend fixed outside compiled hot paths.
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.action_dim)
@@ -147,7 +115,7 @@ class PI0Pytorch(nn.Module):
 
         torch.set_float32_matmul_precision("high")
         if config.pytorch_compile_mode is not None:
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
+            self.enable_torch_compile(mode=config.pytorch_compile_mode)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -217,9 +185,6 @@ class PI0Pytorch(nn.Module):
         )
 
     def sample_time(self, bsize, device):
-        if self.l1_flow and hasattr(self, "timestep_sampler"):
-            t = self.timestep_sampler.sample(bsize)
-            return t.to(dtype=torch.float32, device=device)
         time_beta = sample_beta(1.5, 1.0, bsize, device)
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
@@ -365,14 +330,8 @@ class PI0Pytorch(nn.Module):
             time = self.sample_time(actions.shape[0], actions.device)
 
         time_expanded = time[:, None, None]
-        # L1 Flow: t=0 is noise, t=1 is clean (matches original L1Flow convention)
-        # Standard FM: t=1 is noise, t=0 is clean
-        if self.l1_flow:
-            x_t = time_expanded * actions + (1 - time_expanded) * noise
-        else:
-            x_t = time_expanded * noise + (1 - time_expanded) * actions
-        # L1 Flow: predict x1 (sample), not velocity (noise - actions)
-        u_t = actions if self.l1_flow else noise - actions
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
@@ -417,28 +376,15 @@ class PI0Pytorch(nn.Module):
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        # L1 Flow: use L1 loss on sample space; otherwise MSE on velocity
-        if self.l1_flow:
-            return F.l1_loss(v_t, u_t, reduction="none")
         return F.mse_loss(u_t, v_t, reduction="none")
 
-    @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10, nfe=None) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        bsize = observation.state.shape[0]
-        if noise is None:
-            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
-            noise = self.sample_noise(actions_shape, device)
-
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-
+    def _encode_prefix(self, images, img_masks, lang_tokens, lang_masks):
+        """Encode prefix and build KV cache for denoising."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -448,17 +394,41 @@ class PI0Pytorch(nn.Module):
             use_cache=True,
         )
 
-        # L1 Flow inference with dynamic NFE scheduling (1 or 2)
-        if self.l1_flow:
-            return self._l1_flow_sample(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                noise,
-                bsize,
-                device,
-                nfe=nfe,
+        return prefix_pad_masks, past_key_values
+
+    def _clone_kv_cache(self, past_key_values):
+        """Clone KV cache tensors to avoid CUDAGraph buffer aliasing across invocations."""
+        if isinstance(past_key_values, (list, tuple)):
+            return type(past_key_values)(
+                tuple(t.clone() for t in layer_kv) for layer_kv in past_key_values
             )
+        if hasattr(past_key_values, "key_cache"):
+            past_key_values.key_cache = [k.clone() for k in past_key_values.key_cache]
+            past_key_values.value_cache = [v.clone() for v in past_key_values.value_cache]
+        return past_key_values
+
+    @torch.no_grad()
+    def sample_actions(self, device, observation, noise=None, num_steps=10, nfe=None) -> Tensor:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)."""
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
+
+        bsize = observation.state.shape[0]
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        encoded_prefix = self._encode_prefix(images, img_masks, lang_tokens, lang_masks)
+        if isinstance(encoded_prefix, tuple) and len(encoded_prefix) == 3:
+            _, prefix_pad_masks, past_key_values = encoded_prefix
+        else:
+            prefix_pad_masks, past_key_values = encoded_prefix
+
+        # Keep CUDAGraph step boundaries explicit for each inference call.
+
+        if self.l1_flow:
+            return self._l1_flow_sample(state, prefix_pad_masks, past_key_values, noise, bsize, device, nfe=nfe)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -475,41 +445,9 @@ class PI0Pytorch(nn.Module):
                 expanded_time,
             )
 
-            # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
         return x_t
-
-    def _l1_flow_sample(self, state, prefix_pad_masks, past_key_values, x0, bsize, device, nfe=None):
-        """
-        L1 Flow inference with dynamic NFE scheduling:
-        - nfe=1: single prediction at t=0, skip correction pass.
-        - nfe=2 (default): original 2-step path (coarse + correction).
-        """
-        target_nfe = 2 if nfe is None else int(nfe)
-        if target_nfe <= 1:
-            t0 = torch.zeros(bsize, device=device, dtype=torch.float32)
-            return self.denoise_step(state, prefix_pad_masks, past_key_values, x0, t0)
-
-        # Step 1: Predict x1 at t=0 from pure noise
-        t0 = torch.zeros(bsize, device=device, dtype=torch.float32)
-        x1_pred_coarse = self.denoise_step(
-            state, prefix_pad_masks, past_key_values, x0, t0
-        )
-
-        # Velocity at t=0: v = (x1_pred - x0) / (1 - 0) = x1_pred - x0
-        v_t0 = x1_pred_coarse - x0
-
-        # Euler step to t=0.5: x_0.5 = x0 + 0.5 * v
-        x_mid = x0 + 0.5 * v_t0
-
-        # Step 2: From x_mid at t=0.5, directly predict x1
-        t_mid = torch.full((bsize,), 0.5, device=device, dtype=torch.float32)
-        x1_final = self.denoise_step(
-            state, prefix_pad_masks, past_key_values, x_mid, t_mid
-        )
-
-        return x1_final
 
     def denoise_step(
         self,
@@ -535,9 +473,7 @@ class PI0Pytorch(nn.Module):
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
@@ -552,3 +488,32 @@ class PI0Pytorch(nn.Module):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
+
+    def _l1_flow_sample(self, state, prefix_pad_masks, past_key_values, x0, bsize, device, nfe=None):
+        """L1 Flow inference with configurable NFE (default 2)."""
+        if nfe is None:
+            nfe = 2
+        nfe = max(int(nfe), 1)
+
+        if nfe == 1:
+            t = torch.zeros(bsize, device=device, dtype=torch.float32)
+            return self.denoise_step(state, prefix_pad_masks, past_key_values, x0, t)
+
+        dt = 1.0 / float(nfe)
+        z = x0
+
+        for step in range(nfe):
+            t = torch.full((bsize,), step * dt, device=device, dtype=torch.float32)
+            x1_pred = self.denoise_step(state, prefix_pad_masks, past_key_values, z, t)
+
+            if step == nfe - 1:
+                z = x1_pred
+            else:
+                v = (x1_pred - z) / (1.0 - t[:, None, None]).clamp(min=1e-6)
+                z = z + dt * v
+
+        return z
+
+    def enable_torch_compile(self, mode="default", dynamic=False):
+        """Compile sample_actions directly (baseline behavior)."""
+        self.sample_actions = torch.compile(self.sample_actions, mode=mode)

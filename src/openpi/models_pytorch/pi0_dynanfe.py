@@ -141,7 +141,10 @@ class PI0PytorchWithDynaNFE(PI0Pytorch):
         emb_dim = self.paligemma_with_expert.paligemma.config.text_config.hidden_size
 
         if self.use_nfe_router:
-            nfe_options = getattr(config, "nfe_options", (1, 2, 4))
+            nfe_options = getattr(config, "nfe_options", (1, 2))
+            nfe_options = tuple(nfe_options)
+            if nfe_options != (1, 2):
+                raise ValueError(f"nfe_options must be exactly (1, 2), got {nfe_options}")
             router_hidden_dim = getattr(config, "router_hidden_dim", 256)
 
             self.nfe_router = NFERouter(
@@ -150,6 +153,14 @@ class PI0PytorchWithDynaNFE(PI0Pytorch):
                 hidden_dim=router_hidden_dim,
             )
             self.nfe_options = list(nfe_options)
+
+            compile_mode = getattr(config, "pytorch_compile_mode", None)
+            if compile_mode is not None:
+                self._sample_router_nfe1 = torch.compile(self._sample_router_nfe1, mode=compile_mode)
+                self._sample_router_nfe2 = torch.compile(self._sample_router_nfe2, mode=compile_mode)
+
+            # Keep router dispatch in eager mode, only compile fixed-NFE kernels.
+            self.sample_actions = self._sample_actions_router_dispatch
 
             logger.info(f"NFE Router enabled: nfe_options={nfe_options}")
 
@@ -260,117 +271,36 @@ class PI0PytorchWithDynaNFE(PI0Pytorch):
         return past_key_values
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=None, return_nfe=False):
-        """Inference entry point. Dispatches to Router, AdaFlow, or base L1-flow.
+    def _sample_actions_router_dispatch(self, device, observation, noise=None, num_steps=None, return_nfe=False):
+        """Router dispatch in eager mode; fixed-NFE kernels can be torch.compile'ed."""
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
 
-        When use_nfe_router=True, uses base class sample_actions with router-determined NFE.
-        When use_dynanfe=True, uses AdaFlow adaptive stepping.
-        Otherwise, uses base model behavior (L1-flow or standard flow matching).
-        """
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        if self.use_nfe_router:
-            # Router mode: predict NFE from prefix, then use base class sample_actions with compiled internals
-            images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
-                observation, train=False
-            )
-            prefix_pooled, prefix_pad_masks, past_key_values = self._encode_prefix(
-                images, img_masks, lang_tokens, lang_masks
-            )
-            # Clone to avoid CUDAGraph buffer reuse issues
-            prefix_pooled = prefix_pooled.clone()
-            prefix_pad_masks = prefix_pad_masks.clone()
-            past_key_values = self._clone_kv_cache(past_key_values)
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=False
+        )
+        prefix_pooled, prefix_pad_masks, past_key_values = self._encode_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
 
-            # Compute nfe BEFORE calling compiled methods (avoids graph break from .cpu())
-            logits = self.nfe_router(prefix_pooled)
-            nfe_class = logits.argmax(dim=-1)
-            nfe_idx = int(nfe_class.max().detach().item())
-            nfe = self.nfe_options[nfe_idx]
-
-            if return_nfe:
-                nfe_info = {
-                    "num_steps_taken": torch.full((bsize,), float(nfe), device=device),
-                    "mean_nfe": float(nfe),
-                    "max_nfe": float(nfe),
-                    "min_nfe": float(nfe),
-                    "nfe_class": nfe_class,
-                }
-                actions = self._sample_with_router(
-                    device,
-                    prefix_pooled,
-                    prefix_pad_masks,
-                    past_key_values,
-                    state,
-                    noise,
-                    bsize,
-                    return_nfe=False,
-                    num_steps=nfe,
-                )
-                return actions, nfe_info
-            else:
-                return self._sample_with_router(
-                    device,
-                    prefix_pooled,
-                    prefix_pad_masks,
-                    past_key_values,
-                    state,
-                    noise,
-                    bsize,
-                    return_nfe=False,
-                    num_steps=nfe,
-                )
-
-        elif self.use_dynanfe:
-            # AdaFlow mode: adaptive stepping
-            images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
-                observation, train=False
-            )
-            prefix_pooled, prefix_pad_masks, past_key_values = self._encode_prefix(
-                images, img_masks, lang_tokens, lang_masks
-            )
-            prefix_pooled = prefix_pooled.clone()
-            prefix_pad_masks = prefix_pad_masks.clone()
-            past_key_values = self._clone_kv_cache(past_key_values)
-            return self._sample_adaptive(
-                device, prefix_pooled, prefix_pad_masks, past_key_values,
-                state, noise, bsize, return_nfe,
-            )
-        else:
-            # Use base model behavior (L1-flow or standard flow matching)
-            if self.l1_flow:
-                num_steps = 2
-            return super().sample_actions(device, observation, noise, num_steps=num_steps or 10)
-
-    def _sample_with_router(self, device, prefix_pooled, prefix_pad_masks,
-                            past_key_values, state, noise, bsize, return_nfe, num_steps=None):
-        """Router mode: predict NFE class, run fixed-step uniform denoising."""
         if num_steps is not None:
             nfe = int(num_steps)
             nfe_class = torch.full((bsize,), -1, dtype=torch.long, device=device)
         else:
-            logits = self.nfe_router(prefix_pooled)  # (B, num_classes)
-            nfe_class = logits.argmax(dim=-1)         # (B,)
-            # For batch: use max NFE to ensure quality for all samples
+            logits = self.nfe_router(prefix_pooled)
+            nfe_class = logits.argmax(dim=-1)
             nfe_idx = int(nfe_class.max().detach().item())
-            nfe = self.nfe_options[nfe_idx]
+            nfe = int(self.nfe_options[nfe_idx])
 
-        dt = 1.0 / nfe
-        z = noise.clone()
-
-        for step in range(nfe):
-            t = torch.full((bsize,), step * dt, device=device)
-            x1_pred = self.denoise_step(
-                state, prefix_pad_masks, past_key_values, z, t
-            )
-            if step == nfe - 1:
-                z = x1_pred
-            else:
-                v = (x1_pred - z) / (1.0 - t[:, None, None]).clamp(min=1e-6)
-                z = z + dt * v
+        if nfe <= 1:
+            result = self._sample_router_nfe1(state, prefix_pad_masks, past_key_values, noise, bsize)
+        else:
+            result = self._sample_router_nfe2(state, prefix_pad_masks, past_key_values, noise, bsize)
 
         if return_nfe:
             nfe_info = {
@@ -380,8 +310,78 @@ class PI0PytorchWithDynaNFE(PI0Pytorch):
                 "min_nfe": float(nfe),
                 "nfe_class": nfe_class,
             }
-            return z, nfe_info
-        return z
+            return result, nfe_info
+        return result
+
+    @torch.no_grad()
+    def sample_actions(self, device, observation, noise=None, num_steps=None, return_nfe=False):
+        """Inference entry point. Dispatches to Router, AdaFlow, or base L1-flow.
+
+        When use_nfe_router=True, uses base class sample_actions with router-determined NFE.
+        When use_dynanfe=True, uses AdaFlow adaptive stepping.
+        Otherwise, uses base model behavior (L1-flow or standard flow matching).
+        """
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
+
+        bsize = observation.state.shape[0]
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        if self.use_nfe_router:
+            return self._sample_actions_router_dispatch(
+                device,
+                observation,
+                noise=noise,
+                num_steps=num_steps,
+                return_nfe=return_nfe,
+            )
+
+        if self.use_dynanfe:
+            # AdaFlow mode: adaptive stepping
+            images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+                observation, train=False
+            )
+            prefix_pooled, prefix_pad_masks, past_key_values = self._encode_prefix(
+                images, img_masks, lang_tokens, lang_masks
+            )
+            return self._sample_adaptive(
+                device, prefix_pooled, prefix_pad_masks, past_key_values,
+                state, noise, bsize, return_nfe,
+            )
+
+        # Use base model behavior (L1-flow or standard flow matching)
+        if self.l1_flow:
+            num_steps = 2
+        return super().sample_actions(device, observation, noise, num_steps=num_steps or 10)
+
+    def _sample_router_nfe1(self, state, prefix_pad_masks, past_key_values, noise, bsize):
+        """Router fast path for fixed NFE=1."""
+        z0 = noise
+        t0 = torch.zeros((bsize,), device=z0.device)
+        x1_pred = self.denoise_step(
+            state, prefix_pad_masks, past_key_values, z0, t0
+        )
+        return x1_pred
+
+    def _sample_router_nfe2(self, state, prefix_pad_masks, past_key_values, noise, bsize):
+        """Router fast path for fixed NFE=2."""
+        dt = 0.5
+        z = noise
+
+        t0 = torch.zeros((bsize,), device=z.device)
+        x1_pred = self.denoise_step(
+            state, prefix_pad_masks, past_key_values, z, t0
+        )
+        v0 = (x1_pred - z) / (1.0 - t0[:, None, None]).clamp(min=1e-6)
+        z = z + dt * v0
+
+        t1 = torch.full((bsize,), dt, device=z.device)
+        x1_pred = self.denoise_step(
+            state, prefix_pad_masks, past_key_values, z, t1
+        )
+        return x1_pred
 
     def _sample_adaptive(self, device, prefix_pooled, prefix_pad_masks,
                          past_key_values, state, noise, bsize, return_nfe):
@@ -571,13 +571,11 @@ class PI0PytorchWithDynaNFE(PI0Pytorch):
         return loss, info
 
     def enable_torch_compile(self, mode="default", dynamic=False):
-        """Compile key inference methods for faster execution.
+        """Compile sample_actions directly for inference speed testing."""
+        self.sample_actions = torch.compile(
+            self.sample_actions,
+            options={"triton.cudagraphs": False},
+        )
 
-        Compiles: _encode_prefix, denoise_step, compute_sigma.
-        The outer adaptive loop stays as Python for dynamic break support.
-        """
-        compile_kwargs = dict(mode=mode, dynamic=dynamic)
-        self._encode_prefix = torch.compile(self._encode_prefix, **compile_kwargs)
-        self.denoise_step = torch.compile(self.denoise_step, **compile_kwargs)
-        self.compute_sigma = torch.compile(self.compute_sigma, **compile_kwargs)
+
         logger.info(f"torch.compile enabled: mode={mode}, dynamic={dynamic}")

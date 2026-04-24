@@ -6,6 +6,7 @@ import traceback
 
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
+import torch
 import websockets.asyncio.server as _server
 import websockets.frames
 
@@ -58,8 +59,10 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                with torch.inference_mode():
+                    action = self._policy.infer(obs)
                 infer_time = time.monotonic() - infer_time
+                
                 logger.info(f"Inference time: {infer_time * 1000:.2f} ms")
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,

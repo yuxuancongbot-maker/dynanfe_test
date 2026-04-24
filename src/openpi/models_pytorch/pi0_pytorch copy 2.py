@@ -423,7 +423,7 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10, nfe=None) -> Tensor:
+    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
@@ -448,17 +448,9 @@ class PI0Pytorch(nn.Module):
             use_cache=True,
         )
 
-        # L1 Flow inference with dynamic NFE scheduling (1 or 2)
+        # L1 Flow 2-step inference (NFE=2)
         if self.l1_flow:
-            return self._l1_flow_sample(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                noise,
-                bsize,
-                device,
-                nfe=nfe,
-            )
+            return self._l1_flow_sample(state, prefix_pad_masks, past_key_values, noise, bsize, device)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -480,17 +472,13 @@ class PI0Pytorch(nn.Module):
             time += dt
         return x_t
 
-    def _l1_flow_sample(self, state, prefix_pad_masks, past_key_values, x0, bsize, device, nfe=None):
+    def _l1_flow_sample(self, state, prefix_pad_masks, past_key_values, x0, bsize, device):
         """
-        L1 Flow inference with dynamic NFE scheduling:
-        - nfe=1: single prediction at t=0, skip correction pass.
-        - nfe=2 (default): original 2-step path (coarse + correction).
+        L1 Flow 2-step inference:
+        Step 1: From x0 (t=1, pure noise), predict x1 at t=0, compute velocity,
+                take Euler step to t=0.5 → x_mid
+        Step 2: From x_mid at t=0.5, directly predict x1
         """
-        target_nfe = 2 if nfe is None else int(nfe)
-        if target_nfe <= 1:
-            t0 = torch.zeros(bsize, device=device, dtype=torch.float32)
-            return self.denoise_step(state, prefix_pad_masks, past_key_values, x0, t0)
-
         # Step 1: Predict x1 at t=0 from pure noise
         t0 = torch.zeros(bsize, device=device, dtype=torch.float32)
         x1_pred_coarse = self.denoise_step(
