@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Tuple
 
 import flax.nnx as nnx
 import jax
@@ -33,6 +33,17 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
 
     pytorch_compile_mode: str | None = "max-autotune"
+
+    # DynaNFE: adaptive NFE (AdaFlow-style) config
+    use_dynanfe: bool = False
+    eta: float = 0.1  # AdaFlow step size scaling factor (step = eta / sigma)
+    nfe_max: int = 4  # Maximum number of NFE steps
+    mas_hidden_dim: int = 256  # Hidden dim for MAS head MLP
+
+    # NFE Router: discrete NFE classification
+    use_nfe_router: bool = False
+    nfe_options: Tuple[int, ...] = (1, 2, 4)  # Available NFE step options
+    router_hidden_dim: int = 256  # Hidden dim for NFE router MLP
 
     def __post_init__(self):
         if self.max_token_len is None:

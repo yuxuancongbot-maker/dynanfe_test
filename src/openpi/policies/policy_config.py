@@ -22,6 +22,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    dynanfe_stage2_dir: str | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -37,10 +38,12 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        dynanfe_stage2_dir: Optional directory containing DynaNFE Stage 2 weights
+                           (mas_head.pt or nfe_router.pt).
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
-        presence of "model.safensors" in the checkpoint directory.
+        presence of "model.safetensors" in the checkpoint directory.
     """
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
@@ -53,6 +56,27 @@ def create_trained_policy(
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+
+        # Load DynaNFE Stage 2 weights if provided
+        if dynanfe_stage2_dir is not None:
+            import torch
+            config = train_config.model
+            use_dynanfe = getattr(config, "use_dynanfe", False)
+            use_nfe_router = getattr(config, "use_nfe_router", False)
+
+            if use_dynanfe:
+                mas_path = os.path.join(dynanfe_stage2_dir, "mas_head.pt")
+                if os.path.exists(mas_path):
+                    mas_state_dict = torch.load(mas_path)
+                    model.mas_head.load_state_dict(mas_state_dict, strict=False)
+                    logging.info(f"Loaded MAS Head weights from {mas_path}")
+
+            if use_nfe_router:
+                router_path = os.path.join(dynanfe_stage2_dir, "nfe_router_best.pt")
+                if os.path.exists(router_path):
+                    router_state_dict = torch.load(router_path)
+                    model.nfe_router.load_state_dict(router_state_dict, strict=False)
+                    logging.info(f"Loaded NFE Router weights from {router_path}")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)

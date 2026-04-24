@@ -3,6 +3,7 @@ import time
 from typing import Dict, Optional, Tuple
 
 from typing_extensions import override
+import websockets.exceptions
 import websockets.sync.client
 
 from openpi_client import base_policy as _base_policy
@@ -46,8 +47,16 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
         data = self._packer.pack(obs)
-        self._ws.send(data)
-        response = self._ws.recv()
+
+        try:
+            self._ws.send(data)
+            response = self._ws.recv()
+        except (websockets.exceptions.ConnectionClosed, OSError, EOFError):
+            logging.warning("WebSocket disconnected during infer; reconnecting and retrying once...")
+            self._ws, self._server_metadata = self._wait_for_server()
+            self._ws.send(data)
+            response = self._ws.recv()
+
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")

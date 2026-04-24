@@ -242,8 +242,20 @@ class BaseModelConfig(abc.ABC):
 
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+        config = train_config.model
+
+        # Check if DynaNFE is enabled
+        use_dynanfe = getattr(config, "use_dynanfe", False)
+        use_nfe_router = getattr(config, "use_nfe_router", False)
+
+        if use_dynanfe or use_nfe_router:
+            from openpi.models_pytorch.pi0_dynanfe import PI0PytorchWithDynaNFE
+            model = PI0PytorchWithDynaNFE(config=config)
+            logger.info("Loaded PI0PytorchWithDynaNFE (DynaNFE mode)")
+        else:
+            model = pi0_pytorch.PI0Pytorch(config=config)
+
+        safetensors.torch.load_model(model, weight_path, strict=False)
         return model
 
     @abc.abstractmethod

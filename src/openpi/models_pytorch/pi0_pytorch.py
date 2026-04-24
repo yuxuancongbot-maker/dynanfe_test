@@ -86,6 +86,7 @@ class PI0Pytorch(nn.Module):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+        self.l1_flow = getattr(config, "l1_flow", False)
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -110,7 +111,7 @@ class PI0Pytorch(nn.Module):
 
         torch.set_float32_matmul_precision("high")
         if config.pytorch_compile_mode is not None:
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
+            self.enable_torch_compile(mode=config.pytorch_compile_mode)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -373,21 +374,12 @@ class PI0Pytorch(nn.Module):
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
-    @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        bsize = observation.state.shape[0]
-        if noise is None:
-            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
-            noise = self.sample_noise(actions_shape, device)
-
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-
+    def _encode_prefix(self, images, img_masks, lang_tokens, lang_masks):
+        """Encode prefix and build KV cache for denoising."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
@@ -398,6 +390,41 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+
+        return prefix_pad_masks, past_key_values
+
+    def _clone_kv_cache(self, past_key_values):
+        """Clone KV cache tensors to avoid CUDAGraph buffer aliasing across invocations."""
+        if isinstance(past_key_values, (list, tuple)):
+            return type(past_key_values)(
+                tuple(t.clone() for t in layer_kv) for layer_kv in past_key_values
+            )
+        if hasattr(past_key_values, "key_cache"):
+            past_key_values.key_cache = [k.clone() for k in past_key_values.key_cache]
+            past_key_values.value_cache = [v.clone() for v in past_key_values.value_cache]
+        return past_key_values
+
+    @torch.no_grad()
+    def sample_actions(self, device, observation, noise=None, num_steps=10, nfe=None) -> Tensor:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)."""
+        bsize = observation.state.shape[0]
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        encoded_prefix = self._encode_prefix(images, img_masks, lang_tokens, lang_masks)
+        if isinstance(encoded_prefix, tuple) and len(encoded_prefix) == 3:
+            _, prefix_pad_masks, past_key_values = encoded_prefix
+        else:
+            prefix_pad_masks, past_key_values = encoded_prefix
+
+        # Avoid CUDAGraph output buffer aliasing across denoise calls/invocations
+        prefix_pad_masks = prefix_pad_masks.clone()
+        past_key_values = self._clone_kv_cache(past_key_values)
+
+        if self.l1_flow:
+            return self._l1_flow_sample(state, prefix_pad_masks, past_key_values, noise, bsize, device, nfe=nfe)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -414,7 +441,6 @@ class PI0Pytorch(nn.Module):
                 expanded_time,
             )
 
-            # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
         return x_t
@@ -443,7 +469,6 @@ class PI0Pytorch(nn.Module):
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
@@ -460,3 +485,34 @@ class PI0Pytorch(nn.Module):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
+
+    def _l1_flow_sample(self, state, prefix_pad_masks, past_key_values, x0, bsize, device, nfe=None):
+        """L1 Flow inference with configurable NFE (default 2)."""
+        if nfe is None:
+            nfe = 2
+        nfe = max(int(nfe), 1)
+
+        if nfe == 1:
+            t = torch.zeros(bsize, device=device, dtype=torch.float32)
+            return self.denoise_step(state, prefix_pad_masks, past_key_values, x0, t)
+
+        dt = 1.0 / float(nfe)
+        z = x0
+
+        for step in range(nfe):
+            t = torch.full((bsize,), step * dt, device=device, dtype=torch.float32)
+            x1_pred = self.denoise_step(state, prefix_pad_masks, past_key_values, z, t)
+
+            if step == nfe - 1:
+                z = x1_pred
+            else:
+                v = (x1_pred - z) / (1.0 - t[:, None, None]).clamp(min=1e-6)
+                z = z + dt * v
+
+        return z
+
+    def enable_torch_compile(self, mode="default", dynamic=False):
+        """Compile hot-path subfunctions while keeping outer sampling loops dynamic."""
+        compile_kwargs = dict(mode=mode, dynamic=dynamic)
+        self._encode_prefix = torch.compile(self._encode_prefix, **compile_kwargs)
+        self.denoise_step = torch.compile(self.denoise_step, **compile_kwargs)
